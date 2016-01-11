@@ -238,6 +238,8 @@ static int sparsebundle_read_process_band(sparsebundle_t* sparsebundle, off_t ba
             return -errno;
         }
     } else if (errno != ENOENT && errno != EACCES) {
+        /* TODO -cluck: fail fracefully by retrying */
+        /* see sparsebundle_write_process_band for comments */
         syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
         return -errno;
     }
@@ -443,6 +445,11 @@ static int sparsebundle_write_process_band(sparsebundle_t* sparsebundle, off_t b
             return -errno;
         }
     } else if (errno != ENOENT && errno != EACCES) {
+        /* TODO -cluck: fail fracefully by retrying */
+        /* man open(2) non-fatal errors an user can fix:
+         * EACCES EDQUOT EINTR ELOOP EMFILE ENFILE ENOENT ENOMEM ENOSPC ENOTDIR
+         * ENXIO EPERM EROFS ETXTBSY EWOULDBLOCK
+         */
         syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
         return -errno;
     }

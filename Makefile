@@ -26,6 +26,8 @@ $(TARGET): sparsebundlefs.cpp
 
 all: $(TARGET)
 
+test:
+
 clean:
 	rm -f $(TARGET)
 	rm -Rf $(TARGET).dSYM

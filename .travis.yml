@@ -4,5 +4,7 @@ compiler:
   - clang
 before_install:
  - sudo apt-get update -qq
- - sudo apt-get install -qq libfuse-dev libfuse2 fuse-utils
-script: make
+ - sudo apt-get install -qq libfuse-dev libfuse2 fuse-utils libxml2-dev libxml2-utils
+script:
+ - make
+ - make test

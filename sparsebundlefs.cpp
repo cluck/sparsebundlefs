@@ -138,8 +138,11 @@ static int sparsebundle_iterate_bands(const char *path, size_t length, off_t off
     if (offset >= sparsebundle->size)
         return 0;
 
-    if (offset + length > sparsebundle->size)
-        length = sparsebundle->size - offset;
+    if (offset < 0)
+        return 0;
+
+    if (length + (size_t)offset > sparsebundle->size)
+        length = sparsebundle->size - (size_t)offset;
 
     syslog(LOG_DEBUG, "iterating %zu bytes at offset %ju", length, uintmax_t(offset));
 

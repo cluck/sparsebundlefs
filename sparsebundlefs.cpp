@@ -39,6 +39,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <list>
 #include <sstream>
 #include <streambuf>
 #include <string>
@@ -49,13 +50,23 @@
 #include <libxml/parser.h>
 #include <libxml/xpath.h>
 
-// #define FUSE_SUPPORTS_ZERO_COPY FUSE_VERSION >= 29
+#define FUSE_SUPPORTS_ZERO_COPY FUSE_VERSION >= 29
+
+/* TODO:
+ *  - Replace off_t (signed) with size_t (unsigned)
+ */
 
 using namespace std;
 
-static int sparsebundle_rw_buf_prepare_file(const char *path);
-
 static const char image_path[] = "/sparsebundle.dmg";
+unsigned int max_open_files = 128;
+
+struct sparsebundle_band_t {
+    int fh;
+    int errnr;
+    int mode;
+    struct stat stat;
+};
 
 struct sparsebundle_t {
     char *path;
@@ -64,13 +75,11 @@ struct sparsebundle_t {
     off_t size;
     off_t times_opened;
     bool readonly;
-    bool current_band_write;
-    int current_band_file;
-    int current_band;
-#if FUSE_SUPPORTS_ZERO_COPY
-    map<string, int> open_files;
-#endif
+    map<string, sparsebundle_band_t> open_files;
+    list<string> lru_files;
 };
+
+static sparsebundle_band_t sparsebundle_rw_buf_prepare_file(sparsebundle_t* sparsebundle, const char *path, bool write_intent);
 
 #define sparsebundle_current() \
     static_cast<sparsebundle_t *>(fuse_get_context()->private_data)
@@ -125,22 +134,11 @@ static int sparsebundle_open(const char *path, struct fuse_file_info *fi)
     if (strcmp(path, image_path) != 0)
         return -ENOENT;
 
-    /* FIXME TODO: what is this test for? */
-    /* if ((fi->flags & O_ACCMODE) != O_RDONLY)
-     *  return -EACCES;
-     */
-
     sparsebundle_t *sparsebundle = sparsebundle_current();
 
     sparsebundle->times_opened++;
 
-    if (sparsebundle->times_opened == 1) {
-        sparsebundle->current_band_write = false;
-        sparsebundle->current_band_file = -1;
-        sparsebundle->current_band = 0;
-    }
-
-    syslog(LOG_DEBUG, "opened %s %s%s, now referenced %ju times",
+    syslog(LOG_INFO, "opened %s %s%s, now referenced %ju times",
         (sparsebundle->readonly ? "read-only" : "read-write"),
         sparsebundle->mountpoint, path, uintmax_t(sparsebundle->times_opened));
 
@@ -148,7 +146,6 @@ static int sparsebundle_open(const char *path, struct fuse_file_info *fi)
 }
 
 struct sparsebundle_rw_operations {
-    /* int (*process_band) (const char *, size_t, off_t, void*); */
     int (*process_band) (sparsebundle_t*, off_t, const char *, size_t, off_t, void*);
     int (*pad_with_zeroes) (sparsebundle_t*, size_t, void*);
     void *data;
@@ -160,8 +157,6 @@ static int sparsebundle_iterate_bands(sparsebundle_t* sparsebundle, const char *
 {
     if (strcmp(path, image_path) != 0)
         return -ENOENT;
-
-    //sparsebundle_t *sparsebundle = sparsebundle_current();
 
     if (offset >= sparsebundle->size)
         return 0;
@@ -229,49 +224,18 @@ static int sparsebundle_read_process_band(sparsebundle_t* sparsebundle, off_t ba
     syslog(LOG_DEBUG, "reading %zu bytes at offset %ju into %p",
         length, uintmax_t(offset), *buffer);
 
-    int band_file;
-    if (sparsebundle->current_band_file >= 0 && sparsebundle->current_band != band_number )
-    {
-        syslog(LOG_DEBUG, "closing previous band file %d", sparsebundle->current_band);
-        close(sparsebundle->current_band_file);
-        sparsebundle->current_band_file = -1;
-    }
-    if (sparsebundle->current_band_file < 0) {
-#if FUSE_SUPPORTS_ZERO_COPY
-        band_file = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path);
-#else
-        if (sparsebundle->readonly == true) {
-            band_file = open(band_path, O_RDONLY);
-        } else {
-            /* TODO: currently this creates all "missing" zero-length bands even when reading.
-             *       would be great to delay creating them until an effective write is incoming,
-             *       but this needs additional state or system call per write.
-             */
-            band_file = open(band_path, O_RDWR | O_CREAT, 0644);
-        }
-#endif
-        if (band_file != -1) {
-            sparsebundle->current_band_file = band_file;
-            sparsebundle->current_band = band_number;
-            sparsebundle->current_band_write = false;
-            syslog(LOG_DEBUG, "opened new read band file %d", sparsebundle->current_band);
-        }
-    } else {
-        band_file = sparsebundle->current_band_file;
-        //syslog(LOG_DEBUG, "reusing open band file %d", sparsebundle->current_band);
+    sparsebundle_band_t band;
+    band = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path, false);
+
+    if (band.errnr != 0) {
+        syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(band.errnr));
+        return -band.errnr;
     }
 
-    if (band_file != -1) {
-        read = pread(band_file, *buffer, length, offset);
+    read = pread(band.fh, *buffer, length, offset);
 
-        if (read == -1) {
-            syslog(LOG_ERR, "failed to read band: %s", strerror(errno));
-            return -errno;
-        }
-    } else if (errno != ENOENT && errno != EACCES) {
-        /* TODO -cluck: fail fracefully by retrying */
-        /* see sparsebundle_write_process_band for comments */
-        syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
+    if (read == -1) {
+        syslog(LOG_ERR, "failed to read band: %s", strerror(errno));
         return -errno;
     }
 
@@ -304,33 +268,71 @@ static int sparsebundle_read(const char *path, char *buffer, size_t length, off_
         false
     };
 
-    syslog(LOG_DEBUG, "asked to read %zu bytes at offset %ju", length, uintmax_t(offset));
-
     return sparsebundle_iterate_bands(sparsebundle, path, length, offset, &rw_ops);
 }
 
-#if FUSE_SUPPORTS_ZERO_COPY
-static int sparsebundle_rw_buf_prepare_file(sparsebundle_t* sparsebundle, const char *path)
+static sparsebundle_band_t sparsebundle_rw_buf_prepare_file(sparsebundle_t* sparsebundle, const char *path, bool write_intent)
 {
-    //sparsebundle_t *sparsebundle = sparsebundle_current();
+    sparsebundle_band_t band;
+    map<string, sparsebundle_band_t>::const_iterator iter = sparsebundle->open_files.find(path);
+    errno = 0;
 
-    int fd = -1;
-    map<string, int>::const_iterator iter = sparsebundle->open_files.find(path);
     if (iter != sparsebundle->open_files.end()) {
-        fd = iter->second;
-    } else {
-        syslog(LOG_DEBUG, "file %s not opened yet, opening", path);
-        if (sparsebundle->readonly == true) {
-            fd = open(path, O_RDONLY);
+        if (write_intent == true && (iter->second.mode & O_RDWR) != O_RDWR) {
+            if (iter->second.fh != -1) {
+                syslog(LOG_DEBUG, "file %s is opened read-only, re-opening read-write", path);
+                close(iter->second.fh);
+            } else {
+                syslog(LOG_DEBUG, "file %s does not exist yet, creating", path);
+            }
+            band.fh = open(path, O_RDWR | O_CREAT, 0644);
+            band.errnr = errno;
+            band.mode = O_RDWR | O_CREAT;
+            stat(path, &band.stat);
+
+            sparsebundle->open_files[path] = band;
         } else {
-            fd = open(path, O_RDWR | O_CREAT, 0644);
+            band = iter->second;
         }
-        sparsebundle->open_files[path] = fd;
+    } else {
+
+        if (sparsebundle->lru_files.size() >= max_open_files) {
+            syslog(LOG_INFO, "too many open files, closing least recently opened bands");
+            while (sparsebundle->lru_files.size()*2 >= max_open_files) {
+                const char* lru_path = sparsebundle->lru_files.back().c_str();
+                sparsebundle->lru_files.pop_back();
+                close(sparsebundle->open_files[lru_path].fh);
+                sparsebundle->open_files.erase(lru_path);
+           }
+        }
+
+        if (sparsebundle->readonly == true || write_intent == false) {
+            if (stat(path, &band.stat) == 0) {
+                syslog(LOG_DEBUG, "file %s not opened yet, opening read-only", path);
+                band.fh = open(path, O_RDONLY);
+                band.errnr = errno;
+                band.mode = O_RDONLY;
+            } else {
+                syslog(LOG_DEBUG, "delaying creation of new band file %s until first write", path);
+                band.fh = -1;
+                band.errnr = 0;
+                band.mode = O_RDONLY;
+            }
+        } else {
+            syslog(LOG_DEBUG, "file %s not opened yet, opening read-write", path);
+            band.fh = open(path, O_RDWR | O_CREAT, 0644);
+            band.errnr = errno;
+            band.mode = O_RDWR | O_CREAT;
+            stat(path, &band.stat);
+        }
+        sparsebundle->lru_files.push_front(path);
+        sparsebundle->open_files[path] = band;
     }
 
-    return fd;
+    return band;
 }
 
+#if FUSE_SUPPORTS_ZERO_COPY
 static int sparsebundle_read_buf_process_band(sparsebundle_t* sparsebundle, off_t band_number,
     const char *band_path, size_t length, off_t offset, void *read_data)
 {
@@ -338,21 +340,19 @@ static int sparsebundle_read_buf_process_band(sparsebundle_t* sparsebundle, off_
 
     vector<fuse_buf> *buffers = static_cast<vector<fuse_buf>*>(read_data);
 
-    syslog(LOG_DEBUG, "preparing %zu bytes at offset %ju", length,
-        uintmax_t(offset));
-
-    int band_file_fd = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path);
-    if (band_file_fd != -1) {
-        struct stat band_stat;
-        stat(band_path, &band_stat);
-        read += max(off_t(0), min(static_cast<off_t>(length), band_stat.st_size - offset));
-    } else if (errno != ENOENT && errno != EACCES) {
+    sparsebundle_band_t band = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path, false);
+    if (band.errnr != 0) {
         syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
         return -errno;
     }
 
+    syslog(LOG_DEBUG, "preparing %zu bytes at offset %ju", length,
+        uintmax_t(offset));
+
+    read += max(off_t(0), min(static_cast<off_t>(length), band.stat.st_size - offset));
+
     if (read > 0) {
-        fuse_buf buffer = { read, fuse_buf_flags(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK), 0, band_file_fd, offset };
+        fuse_buf buffer = { read, fuse_buf_flags(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK), 0, band.fh, offset };
         buffers->push_back(buffer);
     }
 
@@ -364,26 +364,25 @@ static const char zero_device[] = "/dev/zero";
 static int sparsebundle_read_buf_pad_with_zeroes(sparsebundle_t* sparsebundle, size_t length, void *read_data)
 {
     vector<fuse_buf> *buffers = static_cast<vector<fuse_buf>*>(read_data);
-    int zero_device_fd = sparsebundle_rw_buf_prepare_file(sparsebundle, zero_device);
-    fuse_buf buffer = { length, fuse_buf_flags(FUSE_BUF_IS_FD), 0, zero_device_fd, 0 };
+    sparsebundle_band_t zero_band = sparsebundle_rw_buf_prepare_file(sparsebundle, zero_device, false);
+    fuse_buf buffer = { length, fuse_buf_flags(FUSE_BUF_IS_FD), 0, zero_band.fh, 0 };
     buffers->push_back(buffer);
 
     return length;
 }
 
-static void sparsebundle_read_buf_close_files()
+static void sparsebundle_rw_close_files()
 {
     sparsebundle_t *sparsebundle = sparsebundle_current();
 
-    syslog(LOG_DEBUG, "closing %u open file descriptor(s)", sparsebundle->open_files.size());
+    syslog(LOG_DEBUG, "closing %lu open file(s)", sparsebundle->lru_files.size());
 
-    map<string, int>::iterator iter;
-    for(iter = sparsebundle->open_files.begin(); iter != sparsebundle->open_files.end(); ++iter) {
-        close(iter->second);
-        syslog(LOG_DEBUG, "closed %s", iter->first.c_str());
+    while (sparsebundle->lru_files.size() > 0) {
+        const char* path = sparsebundle->lru_files.back().c_str();
+        sparsebundle->lru_files.pop_back();
+        close(sparsebundle->open_files[path].fh);
+        sparsebundle->open_files.erase(path);
     }
-
-    sparsebundle->open_files.clear();
 }
 
 static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
@@ -392,6 +391,8 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
     int ret = 0;
 
     vector<fuse_buf> buffers;
+    
+    sparsebundle_t *sparsebundle = sparsebundle_current();
 
     sparsebundle_rw_operations read_ops = {
         &sparsebundle_read_buf_process_band,
@@ -402,19 +403,6 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
 
     syslog(LOG_DEBUG, "asked to read %zu bytes at offset %ju using zero-copy read",
         length, uintmax_t(offset));
-
-    static struct rlimit fd_limit;
-    static bool fd_limit_computed = false;
-    if (!fd_limit_computed) {
-        getrlimit(RLIMIT_NOFILE, &fd_limit);
-        fd_limit_computed = true;
-    }
-
-    sparsebundle_t *sparsebundle = sparsebundle_current();
-    if (sparsebundle->open_files.size() + 1 >= fd_limit.rlim_cur) {
-        syslog(LOG_DEBUG, "hit max number of file descriptors");
-        sparsebundle_read_buf_close_files();
-    }
 
     ret = sparsebundle_iterate_bands(sparsebundle, path, length, offset, &read_ops);
     if (ret < 0)
@@ -440,12 +428,6 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
 
 /* ========== add here write ops ========= */
 
-#if FUSE_SUPPORTS_ZERO_COPY
-// sparsebundle_write_buf() {}
-
-#endif
-
-
 static int sparsebundle_write_process_band(sparsebundle_t* sparsebundle, off_t band_number,
         const char *band_path, size_t length, off_t offset, void *write_data)
 {
@@ -456,52 +438,21 @@ static int sparsebundle_write_process_band(sparsebundle_t* sparsebundle, off_t b
 
     char** buffer = (char**)write_data;
 
-    int band_file;
-    if (sparsebundle->current_band_file >= 0 && (
-        sparsebundle->current_band != band_number ||
-        sparsebundle->current_band_write == false))
-    {
-        syslog(LOG_DEBUG, "closing previous band file %d", sparsebundle->current_band);
-        close(sparsebundle->current_band_file);
-        sparsebundle->current_band_file = -1;
-    }
-    if (sparsebundle->current_band_file < 0) {
-#if FUSE_SUPPORTS_ZERO_COPY
-        band_file = sparsebundle_read_buf_prepare_file(band_path);
-#else
-        band_file = open(band_path, O_RDWR | O_CREAT, 0644);
-#endif
-        if (band_file != -1) {
-            sparsebundle->current_band_file = band_file;
-            sparsebundle->current_band = band_number;
-            sparsebundle->current_band_write = true;
-            syslog(LOG_DEBUG, "opened new write band %d", sparsebundle->current_band);
-        //} else {
-        //    syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
-        //    return -errno;
-        }
-    } else {
-        band_file = sparsebundle->current_band_file;
-        //syslog(LOG_DEBUG, "reusing open write band %d", sparsebundle->current_band);
-    }
+    sparsebundle_band_t band;
+    band = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path, true);
 
     syslog(LOG_DEBUG, "writing %zu bytes at offset %ju from %p",
         length, uintmax_t(offset), *buffer);
 
-    if (band_file != -1) {
-        write = pwrite(band_file, *buffer, length, offset);
+    if (band.errnr != 0) {
+        syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(band.errnr));
+        return -band.errnr;
+    }
 
-        if (write == -1) {
-            syslog(LOG_ERR, "failed to write band: %s", strerror(errno));
-            return -errno;
-        }
-    } else { //if (errno != ENOENT && errno != EACCES) {
-        /* TODO -cluck: fail fracefully by retrying */
-        /* man open(2) non-fatal errors an user can fix:
-         * EACCES EDQUOT EINTR ELOOP EMFILE ENFILE ENOENT ENOMEM ENOSPC ENOTDIR
-         * ENXIO EPERM EROFS ETXTBSY EWOULDBLOCK
-         */
-        syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
+    write = pwrite(band.fh, *buffer, length, offset);
+
+    if (write == -1) {
+        syslog(LOG_ERR, "failed to write band: %s", strerror(errno));
         return -errno;
     }
 
@@ -521,10 +472,6 @@ static int sparsebundle_write(const char *path, const char *buffer, size_t lengt
         &buffer,
         true
     };
-    sparsebundle_filesystem_operations.write = sparsebundle_write;
-    sparsebundle_filesystem_operations.truncate = sparsebundle_truncate;
-
-    syslog(LOG_DEBUG, "asked to write %zu bytes at offset %ju", length, uintmax_t(offset));
 
     return sparsebundle_iterate_bands(sparsebundle, path, length, offset, &write_ops);
 }
@@ -535,32 +482,85 @@ static int sparsebundle_truncate(const char *path, off_t size)
     return truncate;
 }
 
+#if FUSE_SUPPORTS_ZERO_COPY
+
+// new
+static int sparsebundle_write_buf_process_band(sparsebundle_t* sparsebundle, off_t band_number,
+    const char *band_path, size_t length, off_t offset, void *write_data)
+{
+    ssize_t written = 0;
+
+    sparsebundle_band_t band = sparsebundle_rw_buf_prepare_file(sparsebundle, band_path, true);
+    if (band.errnr != 0) {
+        syslog(LOG_ERR, "failed to open band %s: %s", band_path, strerror(errno));
+        return -errno;
+    }
+
+    //vector<fuse_buf> buffers = vector<fuse_buf>((fuse_buf*)write_data);
+    struct fuse_bufvec *buffers = (fuse_bufvec*)write_data;
+    struct fuse_bufvec band_buffer = FUSE_BUFVEC_INIT(length);
+
+    band_buffer.buf[0].flags = (fuse_buf_flags)(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+    band_buffer.buf[0].fd = band.fh;
+    band_buffer.buf[0].pos = offset;
+
+    syslog(LOG_DEBUG, "splicing %zu bytes at offset %ju", length,
+        uintmax_t(offset));
+
+    fuse_buf_copy(&band_buffer, buffers, FUSE_BUF_SPLICE_NONBLOCK);
+
+    return length;
+}
+
+// new
+static int sparsebundle_write_buf(const char *path, struct fuse_bufvec *bufp,
+                        off_t offset, struct fuse_file_info *fi)
+{
+    int ret = 0;
+
+    //vector<fuse_buf> buffers;
+    
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    sparsebundle_rw_operations write_ops = {
+        &sparsebundle_write_buf_process_band,
+        NULL,
+        bufp,
+        true
+    };
+
+    size_t length = fuse_buf_size(bufp);
+
+    syslog(LOG_DEBUG, "asked to write %zu bytes at offset %ju using zero-copy write",
+        length, uintmax_t(offset));
+
+    return sparsebundle_iterate_bands(sparsebundle, path, length, offset, &write_ops);
+}
+
+#endif
+
 /* ==========  end of write ops ======== */
 
+static int sparsebundle_fsync(const char *path, int datasync, struct fuse_file_info *) {
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+    
+    syslog(LOG_DEBUG, "fsync");
 
-
+    if (!sparsebundle->open_files.empty())
+        sparsebundle_rw_close_files();
+}
 
 static int sparsebundle_release(const char *path, struct fuse_file_info *)
 {
     sparsebundle_t *sparsebundle = sparsebundle_current();
-
-    if (sparsebundle->current_band_file != -1) {
-        syslog(LOG_DEBUG, "closing previous band file %d", sparsebundle->current_band);
-        close(sparsebundle->current_band_file);
-        sparsebundle->current_band_file = -1;
-    }
 
     sparsebundle->times_opened--;
     syslog(LOG_DEBUG, "closed %s%s, now referenced %ju times",
         sparsebundle->mountpoint, path, uintmax_t(sparsebundle->times_opened));
 
     if (sparsebundle->times_opened == 0) {
-        syslog(LOG_DEBUG, "no more references, cleaning up");
-
-#if FUSE_SUPPORTS_ZERO_COPY
         if (!sparsebundle->open_files.empty())
-            sparsebundle_read_buf_close_files();
-#endif
+            sparsebundle_rw_close_files();
     }
 
     return 0;
@@ -589,7 +589,8 @@ static int sparsebundle_show_usage(char *program_name)
     return 1;
 }
 
-enum { SPARSEBUNDLE_OPT_DEBUG = 0, SPARSEBUNDLE_OPT_HANDLED = 0, SPARSEBUNDLE_OPT_IGNORED = 1, SPARSEBUNDLE_OPT_WRITE = 2 };
+enum { SPARSEBUNDLE_OPT_HANDLED = 0, SPARSEBUNDLE_OPT_IGNORED = 1,
+       SPARSEBUNDLE_OPT_WRITE = 2, SPARSEBUNDLE_OPT_VERBOSE = 3, SPARSEBUNDLE_OPT_DEBUG = 4 };
 
 static int sparsebundle_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs)
 {
@@ -600,8 +601,10 @@ static int sparsebundle_opt_proc(void *data, const char *arg, int key, struct fu
         setlogmask(LOG_UPTO(LOG_DEBUG));
         return SPARSEBUNDLE_OPT_HANDLED;
 
-    sparsebundle_filesystem_operations.write = sparsebundle_write;
-    sparsebundle_filesystem_operations.truncate = sparsebundle_truncate;
+    case SPARSEBUNDLE_OPT_VERBOSE:
+        setlogmask(LOG_UPTO(LOG_INFO));
+        return SPARSEBUNDLE_OPT_HANDLED;
+
     case SPARSEBUNDLE_OPT_WRITE:
         sparsebundle->readonly = false;
         return SPARSEBUNDLE_OPT_HANDLED;
@@ -679,8 +682,6 @@ const char* plist_get_value(xmlDocPtr doc, const char* key_type, const char* key
             value = xmlNodeListGetString(doc, nodeset->nodeTab[i]->xmlChildrenNode, 1);
             syslog(LOG_DEBUG, "Plist key=%s: value=%s (type %s)", key_name, (char*)value, key_type);
             break;
-    sparsebundle_filesystem_operations.write = sparsebundle_write;
-    sparsebundle_filesystem_operations.truncate = sparsebundle_truncate;
         }
         xmlXPathFreeObject (qResult);
     } else {
@@ -699,6 +700,7 @@ int main(int argc, char **argv)
 
     static struct fuse_opt sparsebundle_options[] = {
         FUSE_OPT_KEY("-w",  SPARSEBUNDLE_OPT_WRITE),
+        FUSE_OPT_KEY("-v",  SPARSEBUNDLE_OPT_VERBOSE),
         FUSE_OPT_KEY("-D",  SPARSEBUNDLE_OPT_DEBUG),
         { 0, 0, 0 } // End of options
     };
@@ -753,7 +755,9 @@ int main(int argc, char **argv)
     sparsebundle_filesystem_operations.release = sparsebundle_release;
 #if FUSE_SUPPORTS_ZERO_COPY
     sparsebundle_filesystem_operations.read_buf = sparsebundle_read_buf;
+    sparsebundle_filesystem_operations.write_buf = sparsebundle_write_buf;
 #endif
+    sparsebundle_filesystem_operations.fsync = sparsebundle_fsync;
     sparsebundle_filesystem_operations.write = sparsebundle_write;
     sparsebundle_filesystem_operations.truncate = sparsebundle_truncate;
 

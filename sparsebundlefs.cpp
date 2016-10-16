@@ -260,7 +260,7 @@ static int sparsebundle_read(const char *path, char *buffer, size_t length, off_
            struct fuse_file_info *)
 {
     sparsebundle_t *sparsebundle = sparsebundle_current();
-    
+
     sparsebundle_rw_operations rw_ops = {
         &sparsebundle_read_process_band,
         sparsebundle_read_pad_with_zeroes,
@@ -371,27 +371,13 @@ static int sparsebundle_read_buf_pad_with_zeroes(sparsebundle_t* sparsebundle, s
     return length;
 }
 
-static void sparsebundle_rw_close_files()
-{
-    sparsebundle_t *sparsebundle = sparsebundle_current();
-
-    syslog(LOG_DEBUG, "closing %lu open file(s)", sparsebundle->lru_files.size());
-
-    while (sparsebundle->lru_files.size() > 0) {
-        const char* path = sparsebundle->lru_files.back().c_str();
-        sparsebundle->lru_files.pop_back();
-        close(sparsebundle->open_files[path].fh);
-        sparsebundle->open_files.erase(path);
-    }
-}
-
 static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
                         size_t length, off_t offset, struct fuse_file_info *fi)
 {
     int ret = 0;
 
     vector<fuse_buf> buffers;
-    
+
     sparsebundle_t *sparsebundle = sparsebundle_current();
 
     sparsebundle_rw_operations read_ops = {
@@ -425,6 +411,20 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
     return ret;
 }
 #endif
+
+static void sparsebundle_rw_close_files()
+{
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    syslog(LOG_DEBUG, "closing %lu open file(s)", sparsebundle->lru_files.size());
+
+    while (sparsebundle->lru_files.size() > 0) {
+        const char* path = sparsebundle->lru_files.back().c_str();
+        sparsebundle->lru_files.pop_back();
+        close(sparsebundle->open_files[path].fh);
+        sparsebundle->open_files.erase(path);
+    }
+}
 
 /* ========== add here write ops ========= */
 
@@ -519,7 +519,7 @@ static int sparsebundle_write_buf(const char *path, struct fuse_bufvec *bufp,
     int ret = 0;
 
     //vector<fuse_buf> buffers;
-    
+
     sparsebundle_t *sparsebundle = sparsebundle_current();
 
     sparsebundle_rw_operations write_ops = {
@@ -543,7 +543,7 @@ static int sparsebundle_write_buf(const char *path, struct fuse_bufvec *bufp,
 
 static int sparsebundle_fsync(const char *path, int datasync, struct fuse_file_info *) {
     sparsebundle_t *sparsebundle = sparsebundle_current();
-    
+
     syslog(LOG_DEBUG, "fsync");
 
     if (!sparsebundle->open_files.empty())
@@ -640,8 +640,8 @@ static off_t read_size(const string &str)
     return value;
 }
 
-xmlXPathObjectPtr getnodeset(xmlDocPtr doc, xmlChar *xpath) 
-{    
+xmlXPathObjectPtr getnodeset(xmlDocPtr doc, xmlChar *xpath)
+{
     xmlXPathContextPtr context;
     xmlXPathObjectPtr result;
 
